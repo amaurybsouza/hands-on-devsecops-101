@@ -1,0 +1,125 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+  sbom-and-sca:
+    name: SBOM and SCA Scan
+    runs-on: ubuntu-latest
+    needs: secret-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+        run: |
+          syft . -o cyclonedx-json=sbom.json
+
+      - name: Run Grype
+        uses: anchore/scan-action@v6
+        with:
+          path: "."
+          output-format: json
+          fail-build: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-report
+          path: sbom.json
+
+  container-scan:
+    name: Container Image Scan
+    runs-on: ubuntu-latest
+    needs: sbom-and-sca
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t devsecops-lab:${{ github.sha }} .
+
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: devsecops-lab:${{ github.sha }}
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          exit-code: 0
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.json
+
+  ai-security-analysis:
+    name: AI Security Analysis
+    runs-on: ubuntu-latest
+    needs: container-scan
+
+    steps:
+      - name: Download Trivy report
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-report
+
+      - name: Build AI prompt
+        run: |
+          cat << 'EOF' > ai_prompt.txt
+          Você é um especialista em DevSecOps.
+
+          Analise o relatório de vulnerabilidades abaixo e gere uma resposta para o time de engenharia.
+
+          Regras:
+          - Responda em português.
+          - Mostre apenas as 5 vulnerabilidades mais relevantes.
+          - Priorize por severidade, impacto e facilidade de exploração.
+          - Explique o risco em linguagem simples.
+          - Sugira uma ação prática de correção.
+          - Não invente vulnerabilidades.
+          - Use apenas os dados do relatório.
+
+          Relatório Trivy:
+          EOF
+
+          cat trivy-report.json >> ai_prompt.txt
+
+      - name: Run Gemini Security Analysis
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_CLI_TRUST_WORKSPACE: true
+        run: |
+          cat ai_prompt.txt | npx @google/gemini-cli@latest -y > ai-security-analysis.md
+
+      - name: Show AI Analysis
+        run: |
+          cat ai-security-analysis.md
+
+      - name: Upload AI Analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-security-analysis
+          path: ai-security-analysis.md
